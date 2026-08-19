@@ -1,0 +1,297 @@
+- name: Provision the VPS
+  hosts: all
+  become: true
+  # a notified handler is discarded when a later task fails, and the idempotent copy
+  # that notified it never notifies again
+  force_handlers: true
+
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    edge_dir: /srv/edge
+    swap_size: 2G
+    admin_user: hendrik
+    admin_keys: https://github.com/henok321.keys
+    acme_email: "{{ lookup('env', 'ACME_EMAIL') }}"
+
+  handlers:
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+
+    - name: Restart Docker
+      ansible.builtin.service:
+        name: docker
+        state: restarted
+
+    # up -d compares the mount spec, not the file behind it, so a changed Caddyfile
+    # needs an explicit reload. Caddy keeps the running config if the new one is invalid
+    - name: Reload Caddy
+      ansible.builtin.command: docker compose exec -T caddy caddy reload --config /etc/caddy/Caddyfile
+      args:
+        chdir: "{{ edge_dir }}"
+      changed_when: true
+
+  tasks:
+    - name: Secrets are provided
+      ansible.builtin.assert:
+        that: acme_email | length > 0
+        fail_msg: Export ACME_EMAIL before running the playbook
+
+    - name: Base packages
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - unattended-upgrades
+          - ufw
+          - python3-debian
+          - cron
+          - sudo
+        update_cache: true
+        cache_valid_time: 3600
+        lock_timeout: 300
+
+    - name: Docker apt repo
+      ansible.builtin.deb822_repository:
+        name: docker
+        types: deb
+        uris: https://download.docker.com/linux/debian
+        suites: "{{ ansible_facts['distribution_release'] }}"
+        components: stable
+        signed_by: https://download.docker.com/linux/debian/gpg
+
+    - name: Docker engine
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        update_cache: true
+        lock_timeout: 300
+
+    - name: Docker daemon config
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: "0644"
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "3" }
+          }
+      notify: Restart Docker
+
+    # before the stack comes up, so the restart does not interrupt a fresh deploy
+    - name: Apply docker daemon config
+      ansible.builtin.meta: flush_handlers
+
+    # 99- sorts after 50unattended-upgrades and 20auto-upgrades, so these win whatever
+    # the package or dpkg-reconfigure wrote; without the reboot a kernel or libc update
+    # installs but never takes effect. "now" means right after the upgrade run
+    # (apt-daily-upgrade.timer, 06:00 + up to an hour): any fixed hh:mm earlier than that
+    # is already past when shutdown is called, so it slips to the following day
+    - name: Unattended upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99-homelab
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          Unattended-Upgrade::Automatic-Reboot "true";
+          Unattended-Upgrade::Automatic-Reboot-Time "now";
+
+    # created once: raising swap_size later does not resize an existing /swapfile
+    - name: Swap file
+      ansible.builtin.command: fallocate -l {{ swap_size }} /swapfile
+      args:
+        creates: /swapfile
+
+    - name: Swap file permissions
+      ansible.builtin.file:
+        path: /swapfile
+        owner: root
+        group: root
+        mode: "0600"
+
+    # asks about /swapfile, not about the host's total swap: an unrelated swap device
+    # would otherwise leave this file unformatted while fstab still points at it
+    - name: Swap file signature
+      ansible.builtin.command: blkid -p -s TYPE -o value /swapfile
+      register: swapfile_signature
+      changed_when: false
+      failed_when: false
+
+    - name: Format swap file
+      ansible.builtin.command: mkswap /swapfile
+      when: swapfile_signature.stdout != "swap"
+      changed_when: true
+
+    - name: Swap file in fstab
+      ansible.posix.mount:
+        path: none
+        src: /swapfile
+        fstype: swap
+        opts: sw
+        state: present
+
+    # not gated on the signature like the format above: a formatted but inactive swapfile
+    # (interrupted run, or a hand-run swapoff) would never be switched back on
+    - name: Swap in use
+      ansible.builtin.command: swapon --noheadings --show=NAME
+      register: active_swap
+      changed_when: false
+
+    - name: Activate swap
+      ansible.builtin.command: swapon /swapfile
+      when: "'/swapfile' not in active_swap.stdout"
+      changed_when: true
+
+    - name: Swappiness
+      ansible.posix.sysctl:
+        name: vm.swappiness
+        value: "10"
+        sysctl_file: /etc/sysctl.d/99-homelab.conf
+
+    # CI authenticates as root over SSH, so root stays permitted — key-only
+    # 10- so it wins: sshd takes the first value it obtains, drop-ins load in lexical order
+    - name: SSH hardening
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/10-hardening.conf
+        mode: "0644"
+        validate: /usr/sbin/sshd -t -f %s
+        content: |
+          PermitRootLogin prohibit-password
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+      notify: Restart sshd
+
+    - name: Admin account
+      ansible.builtin.user:
+        name: "{{ admin_user }}"
+        groups: [sudo, docker]
+        append: true
+        shell: /bin/bash
+
+    # exclusive: a key dropped from the GitHub account loses access here on the next run
+    - name: Admin keys
+      ansible.posix.authorized_key:
+        user: "{{ admin_user }}"
+        key: "{{ admin_keys }}"
+        exclusive: true
+
+    # the account has no password to type, so sudo cannot ask for one
+    - name: Passwordless sudo for the admin
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/010-{{ admin_user }}
+        mode: "0440"
+        content: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        validate: visudo -cf %s
+
+    - name: Firewall rules
+      community.general.ufw:
+        rule: allow
+        port: "{{ item.port }}"
+        proto: "{{ item.proto }}"
+      loop:
+        - { port: "22", proto: tcp }
+        - { port: "80", proto: tcp }
+        - { port: "443", proto: tcp }
+        - { port: "443", proto: udp }
+        - { port: "51820", proto: udp }
+
+    - name: Firewall enabled, incoming denied
+      community.general.ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    # the only thing services need from this playbook: they attach to it as external, so a
+    # service deployed before the host was provisioned fails loudly instead of creating its own
+    - name: Edge network
+      ansible.builtin.command: docker network create edge
+      register: edge_network
+      changed_when: edge_network.rc == 0
+      failed_when: edge_network.rc != 0 and 'already exists' not in edge_network.stderr
+
+    - name: Edge directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop:
+        - "{{ edge_dir }}"
+        - "{{ edge_dir }}/sites"
+
+    - name: Edge compose file
+      ansible.builtin.copy:
+        src: edge/compose.yaml
+        dest: "{{ edge_dir }}/compose.yaml"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Edge environment file
+      ansible.builtin.copy:
+        dest: "{{ edge_dir }}/.env"
+        owner: root
+        group: docker
+        mode: "0640"
+        content: "ACME_EMAIL={{ acme_email }}\n"
+
+    - name: Caddyfile
+      ansible.builtin.copy:
+        src: edge/Caddyfile
+        dest: "{{ edge_dir }}/Caddyfile"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload Caddy
+
+    - name: Backup script
+      ansible.builtin.copy:
+        src: backup.sh
+        dest: /usr/local/bin/srv-backup
+        mode: "0755"
+
+    # written outright rather than through the cron module, which would keep any
+    # hand-made line in the file beside the one it manages
+    - name: Nightly backup
+      ansible.builtin.copy:
+        dest: /etc/cron.d/srv-backup
+        mode: "0644"
+        content: |
+          15 3 * * * root /usr/local/bin/srv-backup
+
+    # the box was provisioned by hand, then by the playbook that lived in
+    # knobel-manager-service before this repo existed
+    - name: Files the old layout left behind
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/docker.list           # superseded by docker.sources
+        - /etc/apt/apt.conf.d/99-unattended-reboot      # folded into 99-homelab
+        - /etc/apt/apt.conf.d/99-knobel-manager         # renamed to 99-homelab
+        - /etc/sysctl.d/99-knobel-manager.conf          # renamed to 99-homelab.conf
+        - /etc/ssh/sshd_config.d/hardening.conf         # superseded by 10-hardening.conf
+        - /usr/local/bin/knobel-manager-deploy          # the script the pinned CI key ran
+        - /usr/local/bin/knobel-manager-backup          # superseded by srv-backup
+        - /etc/cron.d/knobel-manager-backup             # superseded by srv-backup
+      notify: Restart sshd
+
+    - name: User the pinned CI key logged in as
+      ansible.builtin.user:
+        name: deploy
+        state: absent
+        remove: true
+        # userdel exits non-zero on a live session or an unremovable home, and this task
+        # sits one step before the container update
+        force: true
+
+    - name: Pull and start edge stack
+      ansible.builtin.command: docker compose up -d --wait --wait-timeout 120 --pull always --remove-orphans
+      args:
+        chdir: "{{ edge_dir }}"
+      changed_when: true

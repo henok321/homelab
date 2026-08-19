@@ -1,0 +1,56 @@
+default_stages: [ pre-commit, pre-push ]
+fail_fast: false
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+      - id: detect-private-key
+      - id: check-added-large-files
+  - repo: https://github.com/betterleaks/betterleaks
+    rev: v1.8.1
+    hooks:
+      - id: betterleaks
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.12
+    hooks:
+      - id: actionlint
+        name: "Lint GitHub Workflows"
+        files: \.github/workflows/.*\.(yml|yaml)$
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.13.1-1
+    hooks:
+      - id: shfmt
+  - repo: https://github.com/ansible/ansible-lint
+    rev: v26.8.0
+    hooks:
+      - id: ansible-lint
+        # the bundle, not ansible-core: the playbook uses ansible.posix and community.general
+        additional_dependencies: [ "ansible==14.2.0" ]
+        always_run: false
+        files: ^site\.yml$
+        args: [ "site.yml" ]
+  - repo: local
+    hooks:
+      - id: caddy-fmt
+        name: caddy fmt
+        language: docker_image
+        entry: caddy:2-alpine caddy fmt --overwrite
+        files: ^edge/Caddyfile$
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.49.1
+    hooks:
+      - id: markdownlint
+        files: \.(md|markdown)$
+        args: [ "--disable=MD013", "--disable=MD033", "--disable=MD010" ] # Caddyfile snippets are tab-indented

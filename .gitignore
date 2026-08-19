@@ -1,0 +1,5 @@
+# local secrets for running the playbook by hand
+.ansible-env
+
+# ansible collection cache
+.ansible/

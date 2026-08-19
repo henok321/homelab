@@ -1,0 +1,10 @@
+{
+	email {$ACME_EMAIL}
+}
+
+# the app only emits HSTS when r.TLS != nil, which is never true behind the proxy
+(common) {
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
+}
+
+import /etc/caddy/sites/*.caddy

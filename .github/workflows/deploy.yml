@@ -1,0 +1,63 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    permissions: { }
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --all-files
+
+  deploy:
+    name: Provision VPS
+    needs: lint
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions: { }
+    environment:
+      name: production
+    concurrency:
+      group: production-deployment
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Install Ansible
+        run: pipx install --include-deps ansible==14.2.0
+
+      - name: Provision
+        env:
+          KEY: ${{ secrets.VPS_SSH_KEY }}
+          HOST: ${{ vars.VPS_HOST }}
+          HOST_KEY: ${{ vars.VPS_HOST_KEY }}
+          ACME_EMAIL: ${{ vars.ACME_EMAIL }}
+        run: |
+          # an empty inventory makes ansible-playbook exit 0 without touching anything
+          [ -n "$HOST" ] || { echo "VPS_HOST is not set"; exit 1; }
+          [ -n "$HOST_KEY" ] || { echo "VPS_HOST_KEY is not set: ssh-keyscan -t ed25519 <host>"; exit 1; }
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$KEY" >~/.ssh/id && chmod 600 ~/.ssh/id
+          printf '%s\n' "$HOST_KEY" >~/.ssh/known_hosts
+          ansible-playbook -i "$HOST," -u root --private-key ~/.ssh/id site.yml
